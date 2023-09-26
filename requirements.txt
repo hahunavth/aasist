@@ -1,4 +1,5 @@
 torch>=1.6.0
-torchcontrib
-numpy
-soundfile
+torchcontrib~=0.0.2
+numpy~=1.21.5
+soundfile~=0.12.1
+hyperpyyaml~=1.2.2

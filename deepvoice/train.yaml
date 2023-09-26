@@ -1,0 +1,83 @@
+# ############################################################################
+# Model: AASIST
+# Raw data: https://www.kaggle.com/datasets/birdy654/deep-voice-deepfake-voice-recognition
+# Dataset: https://www.kaggle.com/datasets/hahunavth/sv-deep-voice-preprocessed
+# Preprocess code: https://www.kaggle.com/code/hahunavth/sv-deep-voice-preprocessing
+# Author: hahunavth
+# Created: 2023-09-26
+# ############################################################################
+name: deepvoice
+
+# args
+output_dir: !PLACEHOLDER    # output_path
+seed: 1234
+comment: ""
+eval: False
+
+# set seed
+__set_seed: !applyref:train.set_seed
+    _args:
+        - !ref <seed>
+    _kwargs:
+        cudnn_deterministic: True
+        cudnn_benchmark: True
+
+# training parameters
+batch_size: 24
+epochs: 100
+
+# eval
+eval_out_file: "eval_scores_using_best_dev_model.txt"   # eval_output
+eval_all_best: True
+
+# model tag
+model_tag: !applyref:train.get_model_tag
+    prefix: !ref <name>
+    batch_size: !ref <batch_size>
+    epochs: !ref <epochs>
+    postfix: !ref <comment>
+
+# dataset
+dataset_path: /kaggle/input/sv-deep-voice-preprocessed/out
+train_dir: !ref <dataset_path>/train
+val_dir: !ref <dataset_path>/dev
+test_dir: !ref <dataset_path>/test
+#
+dataloader_list: !apply:train.get_loader
+    train_dir:  !ref <train_dir>
+    valid_dir:  !ref <val_dir>
+    test_dir:   !ref <test_dir>
+    seed:       !ref <seed>
+    batch_size: !ref <batch_size>
+
+# output
+model_tag_dir: !ref <output_dir>/<model_tag>                  # model_tag 3
+checkpoint_dir: !ref <model_tag_dir>/checkpoints              # model_save_path
+eval_score_file: !ref <model_tag_dir>/<eval_out_file>         # eval_score_path
+metric_dir: !ref <model_tag_dir>/metrics                      # metric_path = model_tag / "metrics"
+# logger
+writer: !new:torch.utils.tensorboard.SummaryWriter
+    - !ref <model_tag_dir>                                                     # model_tag
+
+
+# model
+model: !new:models.AASIST.Model
+    -
+        nb_samp: 646004
+        first_conv: 128
+        filts: [70, [1, 32], [32, 32], [32, 64], [64, 64]]
+        gat_dims: [64, 32]
+        pool_ratios: [0.5, 0.7, 0.5, 0.5]
+        temperatures: [2.0, 2.0, 100.0, 100.0]
+
+
+# optimizer
+optim_config:
+    optimizer: adam
+    amsgrad: "False"
+    base_lr: 0.0001
+    lr_min: 0.000005
+    betas: [0.9, 0.999]
+    weight_decay: 0.0001
+    scheduler: cosine
+    epochs: !ref <epochs>
