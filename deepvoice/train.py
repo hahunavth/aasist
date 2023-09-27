@@ -11,6 +11,7 @@
 
 import argparse
 import random, os
+from glob import glob
 from pprint import pprint
 from types import SimpleNamespace
 from typing import Dict, List, Union
@@ -23,7 +24,9 @@ from hyperpyyaml import load_hyperpyyaml
 from torch.utils.data import DataLoader, Dataset
 from torchcontrib.optim import SWA
 
+# reuse from original repo
 from utils import create_optimizer
+from evaluation import compute_eer
 
 
 def set_seed(seed, cudnn_deterministic=True, cudnn_benchmark=False):
@@ -156,9 +159,48 @@ def get_loader(
     return trn_loader, dev_loader, test_loader
 
 
+def get_ckpt(ckpt_dir, model, use_ckpt, restore_ep) -> None:
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    if not use_ckpt:
+        print("No ckpt is used")
+        return None
+    if not os.path.exists(ckpt_dir):
+        print("No ckpt is found")
+        return None
+    if restore_ep != -1:
+        ckpt_pattern = f"epoch_{restore_ep}_*"
+        ckpts = glob(os.path.join(ckpt_dir, ckpt_pattern))
+        if len(ckpts) == 0:
+            raise RuntimeError(f"No ckpt is found with pattern: {ckpt_pattern}")
+        else:
+            if len(ckpts) > 1:
+                raise RuntimeError(f"More than 1 ckpt is found with pattern: {ckpt_pattern}")
+            ckpt = ckpts[0]
+            model.load_state_dict(torch.load(ckpt, map_location=device))
+            print(f"Load ckpt ep {restore_ep}: {ckpt}")
+            return ckpt
+    else:
+        ckpts = os.listdir(ckpt_dir)
+        last_ckpt = None
+        last_ep = -1
+        for ckpt in ckpts:
+            if ckpt.endswith(".pth") and ckpt.startswith("epoch_"):
+                ep = int(ckpt.split("_")[1])
+                if ep > last_ep:
+                    last_ep = ep
+                    last_ckpt = ckpt
+        if last_ckpt is not None:
+            model.load_state_dict(
+                torch.load(os.path.join(ckpt_dir, last_ckpt), map_location=device)
+            )
+            print(f"Load latest ckpt: {last_ckpt}")
+        return last_ckpt if last_ckpt != -1 else None
+
+
 def produce_evaluation_file(
         data_loader: DataLoader,
-        model,
+        model: torch.nn.Module,
         device: torch.device,
         save_path: str) -> None:
     """Perform evaluation and save the score to a file"""
@@ -188,13 +230,20 @@ def calculate_EER(cm_scores_file="/kaggle/working/name_ep1_bs24/eval_scores_usin
     cm_keys = cm_data[:, 1]
     cm_scores = cm_data[:, 0].astype(np.float64)
 
-    bona_cm = cm_scores[cm_keys == '1'] # 'bonafide'
-    spoof_cm = cm_scores[cm_keys == '0'] # 'spoof'
+    bona_cm = cm_scores[cm_keys == '1']     # 'bona-fide'
+    spoof_cm = cm_scores[cm_keys == '0']    # 'spoof'
 
-    from evaluation import compute_eer
     eer_cm = compute_eer(bona_cm, spoof_cm)[0]
 
     return eer_cm * 100
+
+
+def eval_eer(dataloader, model, device, eval_score_file):
+    """Evaluate the model on the dev set, and save the score to a file"""
+    produce_evaluation_file(dataloader, model, device, eval_score_file)
+    # todo: calculate_tDCF_EER
+    eer = calculate_EER(eval_score_file)
+    return eer
 
 
 def train(
@@ -210,7 +259,7 @@ def train(
         hparams
 ):
     # train
-    best_dev_eer = 1000.  # 1.
+    best_dev_eer = 100.  # in original code: 1.
     best_eval_eer = 100.
     best_dev_tdcf = 0.05
     best_eval_tdcf = 1.
@@ -227,16 +276,18 @@ def train(
     if "freq_aug" not in hparams:
         hparams["freq_aug"] = "False"
 
+    # note: epoch here is starting from 0
+    # this is same as the original implementation
+    # just kept it to be consistent with the original implementation
     for epoch in range(hparams["epochs"]):
         print("Start training epoch{:03d}".format(epoch))
 
-        # todo
+        # todo: custom train_epoch fn
         from main import train_epoch
         running_loss = train_epoch(trn_loader, model, optimizer, device, scheduler, hparams)
-        produce_evaluation_file(dev_loader, model, device, eval_score_file)
 
-        # todo: calculate_tDCF_EER
-        dev_eer = calculate_EER(eval_score_file)
+        # eval on dev set
+        dev_eer = eval_eer(dev_loader, model, device, eval_score_file)
         print("DONE.")
         print("Loss:{:.5f}, dev_eer: {:.3f}".format(running_loss, dev_eer))
 
@@ -252,7 +303,9 @@ def train(
             )
 
             # todo: do evaluation whenever best model is renewed
-            #
+            # eval on test set
+            # if hparams["eval_all_best"] == "True":
+            # ...
 
             print("Saving epoch {} for swa".format(epoch))
             optimizer_swa.update_swa()
@@ -301,13 +354,11 @@ if __name__ == "__main__":
             "comment": args.comment,
             "eval": args.eval
         })
-        pprint(hparams)
+        # pprint(hparams)
 
         # torch device
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print("Device: {}".format(device))
-        # if device != "cuda":
-        #     raise Exception("Cuda is not available!")
 
         # tag
         model_tag = hparams["model_tag"]
@@ -318,14 +369,16 @@ if __name__ == "__main__":
         os.makedirs(output_dir, exist_ok=True)
         os.makedirs(model_tag_dir, exist_ok=True)
         os.makedirs(ckpt_dir, exist_ok=True)
-
+        # file
         eval_score_file = hparams['eval_score_file']
 
         writer = hparams["writer"]
 
         # get model
-        model = hparams['model']
+        model: torch.nn.Module = hparams['model']
         model = model.to(device)
+
+        pretrained = hparams['pretrained']
 
         # dataloader
         trn_loader, dev_loader, test_loader = hparams["dataloader_list"]
@@ -351,5 +404,7 @@ if __name__ == "__main__":
                 hparams
             )
         else:
-            # todo: evaluate
+            # evaluate
+            eer = eval_eer(test_loader, model, device, eval_score_file)
+            print("EER: {:.3f}".format(eer))
             pass
