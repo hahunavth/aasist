@@ -27,20 +27,25 @@ from torchcontrib.optim import SWA
 # reuse from original repo
 from utils import create_optimizer
 from evaluation import compute_eer
+from data_utils import pad_random
+from utils import seed_worker
+from main import train_epoch
 
 
-def set_seed(seed, cudnn_deterministic=True, cudnn_benchmark=False):
-    """
+def set_seed(seed, config = None):
+    """ 
     set initial seed for reproduction
     """
+    if config is None:
+        raise ValueError("config should not be None")
+
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-        torch.backends.cudnn.deterministic = cudnn_deterministic
-        torch.backends.cudnn.benchmark = cudnn_benchmark
-
+        torch.backends.cudnn.deterministic = config["cudnn_deterministic_toggle"]
+        torch.backends.cudnn.benchmark = config["cudnn_benchmark_toggle"]
 
 def get_model_tag(
         prefix: str = None,
@@ -72,27 +77,19 @@ def genSpoof_list(audio_dir, real_dir="REAL", fake_dir="FAKE"):
     return d_meta, file_list
 
 
-def pad_random(x: np.ndarray, max_len: int = 64600):
-    x_len = x.shape[0]
-    # if duration is already long enough
-    if x_len >= max_len:
-        stt = np.random.randint(x_len - max_len)
-        return x[stt:stt + max_len]
-
-    # if too short
-    num_repeats = int(max_len / x_len) + 1
-    padded_x = np.tile(x, num_repeats)[:max_len]
-    return padded_x
-
-
 class DeepVoiceDataset(Dataset):
-    def __init__(self, list_fname, labels, base_dir, real_dir='REAL', fake_dir='FAKE'):
+    def __init__(
+            self, 
+            list_fname, labels, 
+            base_dir, real_dir='REAL', fake_dir='FAKE', 
+            cut=64600 # take ~4 sec audio (64600 samples)
+        ):
         self.list_fname = list_fname
         self.labels = labels
         self.base_dir = base_dir
         self.real_dir = real_dir
         self.fake_dir = fake_dir
-        self.cut = 64600  # take ~4 sec audio (64600 samples)
+        self.cut = cut
 
     def __len__(self):
         return len(self.list_fname)
@@ -107,36 +104,29 @@ class DeepVoiceDataset(Dataset):
         return x_inp, y
 
     @staticmethod
-    def from_dir(lb_cont_dir):
+    def from_dir(lb_cont_dir, cut=64600):
         """
         Load dataset from directory
         :param lb_cont_dir: directory containing the label with name is the label and content is the list of file name
         """
         d_meta, file_list = genSpoof_list(lb_cont_dir)
-        return DeepVoiceDataset(file_list, d_meta, lb_cont_dir)
+        print(f"Dataset: Load {len(file_list)} files from {lb_cont_dir}")
+        return DeepVoiceDataset(file_list, d_meta, lb_cont_dir, cut=cut)
 
 
 def get_loader(
-        train_dir: str,
-        valid_dir: str,
-        test_dir: str,
+        train_set: DeepVoiceDataset,
+        valid_set: DeepVoiceDataset,
+        test_set: DeepVoiceDataset,
         seed: int,
         batch_size: int) -> List[torch.utils.data.DataLoader]:
 
+    # train_set = DeepVoiceDataset.from_dir(train_dir)
+    # dev_set = DeepVoiceDataset.from_dir(valid_dir)
+    # test_set = DeepVoiceDataset.from_dir(test_dir)
+
     gen = torch.Generator()
     gen.manual_seed(seed)
-
-    train_set = DeepVoiceDataset.from_dir(train_dir)
-    dev_set = DeepVoiceDataset.from_dir(valid_dir)
-    test_set = DeepVoiceDataset.from_dir(test_dir)
-
-    def seed_worker(worker_id):
-        """
-        Used in generating seed for the worker of torch.utils.data.Dataloader
-        """
-        worker_seed = torch.initial_seed() % 2 ** 32
-        np.random.seed(worker_seed)
-        random.seed(worker_seed)
 
     trn_loader = DataLoader(train_set,
                             batch_size=batch_size,
@@ -145,7 +135,7 @@ def get_loader(
                             pin_memory=True,
                             worker_init_fn=seed_worker,
                             generator=gen)
-    dev_loader = DataLoader(dev_set,
+    dev_loader = DataLoader(valid_set,
                             batch_size=batch_size,
                             shuffle=False,
                             drop_last=False,
@@ -159,15 +149,15 @@ def get_loader(
     return trn_loader, dev_loader, test_loader
 
 
-def get_ckpt(ckpt_dir, model, use_ckpt, restore_ep) -> None:
+def get_ckpt(ckpt_dir, model, use_ckpt, restore_ep) -> int:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     if not use_ckpt:
         print("No ckpt is used")
-        return None
+        return 0
     if not os.path.exists(ckpt_dir):
         print("No ckpt is found")
-        return None
+        return 0
     if restore_ep != -1:
         ckpt_pattern = f"epoch_{restore_ep}_*"
         ckpts = glob(os.path.join(ckpt_dir, ckpt_pattern))
@@ -179,7 +169,7 @@ def get_ckpt(ckpt_dir, model, use_ckpt, restore_ep) -> None:
             ckpt = ckpts[0]
             model.load_state_dict(torch.load(ckpt, map_location=device))
             print(f"Load ckpt ep {restore_ep}: {ckpt}")
-            return ckpt
+            return restore_ep
     else:
         ckpts = os.listdir(ckpt_dir)
         last_ckpt = None
@@ -195,7 +185,7 @@ def get_ckpt(ckpt_dir, model, use_ckpt, restore_ep) -> None:
                 torch.load(os.path.join(ckpt_dir, last_ckpt), map_location=device)
             )
             print(f"Load latest ckpt: {last_ckpt}")
-        return last_ckpt if last_ckpt != -1 else None
+        return int(last_ckpt.split('_')[1]) if last_ckpt != -1 else 0
 
 
 def produce_evaluation_file(
@@ -270,20 +260,15 @@ def train(
     metric_dir = hparams["metric_dir"]
     os.makedirs(metric_dir, exist_ok=True)
 
-    # todo: refactor in train_epoch fn
-    if "eval_all_best" not in hparams:
-        hparams["eval_all_best"] = "True"
-    if "freq_aug" not in hparams:
-        hparams["freq_aug"] = "False"
+    pretrained_ep = hparams['pretrained']
 
     # note: epoch here is starting from 0
     # this is same as the original implementation
     # just kept it to be consistent with the original implementation
-    for epoch in range(hparams["epochs"]):
+    for epoch in range(pretrained_ep, hparams["epochs"]):
         print("Start training epoch{:03d}".format(epoch))
 
         # todo: custom train_epoch fn
-        from main import train_epoch
         running_loss = train_epoch(trn_loader, model, optimizer, device, scheduler, hparams)
 
         # eval on dev set
@@ -323,6 +308,12 @@ if __name__ == "__main__":
                         # required=True
                         )
     parser.add_argument(
+        "--dataset_path",
+        dest="dataset_path",
+        type=str,
+        default="./dataset",
+    )
+    parser.add_argument(
         "--output_dir",
         dest="output_dir",
         type=str,
@@ -345,20 +336,34 @@ if __name__ == "__main__":
     #                     type=str,
     #                     default=None,
     #                     help="directory to the model weight file (can be also given in the config file)")
+    parser.add_argument("--train_cut", type=int, default=64600)
+    parser.add_argument("--valid_cut", type=int, default=64600)
+    parser.add_argument("--test_cut", type=int, default=64600)
+    parser.add_argument("--batch_size", type=int, default=24)
     args = parser.parse_args()
 
+    print("=" * 5)
     with open(args.hparams, "r") as f:
         hparams = load_hyperpyyaml(f, {
-            "output_dir": args.output_dir,
-            "seed": args.seed,
-            "comment": args.comment,
-            "eval": args.eval
+            "output_dir":   args.output_dir,
+            "seed":         args.seed,
+            "comment":      args.comment,
+            "eval":         args.eval,
+            "dataset_path": args.dataset_path,
+            "train_cut":    args.train_cut,
+            "valid_cut":    args.valid_cut,
+            "test_cut":     args.test_cut,
+            "batch_size":   args.batch_size,
         })
         # pprint(hparams)
+
+        # seed
+        print("Initial seed: ", torch.random.initial_seed())
 
         # torch device
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print("Device: {}".format(device))
+        print("="*5)
 
         # tag
         model_tag = hparams["model_tag"]
@@ -372,13 +377,20 @@ if __name__ == "__main__":
         # file
         eval_score_file = hparams['eval_score_file']
 
+        print("Dataset_path: {}".format(hparams['dataset_path']))
+        print("Output dir: {}".format(output_dir))
+        print("Model tag: {}".format(model_tag))
+        print("Eval score file: {}".format(eval_score_file))
+        print("="*5)
+
         writer = hparams["writer"]
 
         # get model
         model: torch.nn.Module = hparams['model']
         model = model.to(device)
-
-        pretrained = hparams['pretrained']
+        print("Total number of parameters: {}".format(sum(p.numel() for p in model.parameters())))
+        print("Trainable parameters: {}".format(sum(p.numel() for p in model.parameters() if p.requires_grad)))
+        print("="*5)
 
         # dataloader
         trn_loader, dev_loader, test_loader = hparams["dataloader_list"]
@@ -388,6 +400,10 @@ if __name__ == "__main__":
         optim_config["steps_per_epoch"] = len(trn_loader)
         optimizer, scheduler = create_optimizer(model.parameters(), optim_config)
         optimizer_swa = SWA(optimizer)
+
+        # todo: refactor in train_epoch fn
+        if "freq_aug" not in hparams:
+            hparams["freq_aug"] = "False"
 
         # train
         if not hparams["eval"]:

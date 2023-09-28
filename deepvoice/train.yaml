@@ -24,8 +24,9 @@ __set_seed: !applyref:train.set_seed
     _args:
         - !ref <seed>
     _kwargs:
-        cudnn_deterministic: True
-        cudnn_benchmark: True
+        config:
+            cudnn_deterministic_toggle: True
+            cudnn_benchmark_toggle: False
 
 # training parameters
 batch_size: 24
@@ -43,15 +44,25 @@ model_tag: !applyref:train.get_model_tag
     postfix: !ref <comment>
 
 # dataset
-dataset_path: /kaggle/input/sv-deep-voice-preprocessed/out
+dataset_path: !PLACEHOLDER # relative path to dataset, e.g. ../input/sv-deep-voice-preprocessed/out
 train_dir: !ref <dataset_path>/train
-val_dir: !ref <dataset_path>/dev
+valid_dir: !ref <dataset_path>/dev
 test_dir: !ref <dataset_path>/test
 #
+train_cut: 64600
+valid_cut: 64600
+test_cut: 64600
+#
 dataloader_list: !apply:train.get_loader
-    train_dir:  !ref <train_dir>
-    valid_dir:  !ref <val_dir>
-    test_dir:   !ref <test_dir>
+    train_set: !apply:train.DeepVoiceDataset.from_dir  
+        lb_cont_dir: !ref <train_dir>
+        cut: !ref <train_cut>
+    valid_set: !apply:train.DeepVoiceDataset.from_dir  
+        lb_cont_dir: !ref <valid_dir>
+        cut: !ref <valid_cut>
+    test_set: !apply:train.DeepVoiceDataset.from_dir  
+        lb_cont_dir: !ref <test_dir>
+        cut: !ref <test_cut>
     seed:       !ref <seed>
     batch_size: !ref <batch_size>
 
@@ -62,7 +73,7 @@ eval_score_file: !ref <model_tag_dir>/<eval_out_file>         # eval_score_path
 metric_dir: !ref <model_tag_dir>/metrics                      # metric_path = model_tag / "metrics"
 # logger
 writer: !new:torch.utils.tensorboard.SummaryWriter
-    - !ref <model_tag_dir>                                                     # model_tag
+    - !ref <model_tag_dir>                                          # model_tag
 
 
 # model
